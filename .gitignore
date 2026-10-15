@@ -1,0 +1,13 @@
+# PlatformIO build files
+.pio/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local secrets
+.env
+secrets.h
+
+# Local VS Code / PlatformIO IntelliSense configuration
+.vscode/c_cpp_properties.json
