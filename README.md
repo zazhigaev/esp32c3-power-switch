@@ -89,3 +89,121 @@
 |                                          |               |
 |                                          +---> к GND платы
 +----------------------------------------------------------+
+```
+
+---
+## Сборка и прошивка (PlatformIO)
+
+Конфигурация platformio.ini
+```text
+[env:esp32-c3-supermini]
+platform = espressif32
+board = esp32-c3-devkitm-1
+framework = arduino
+
+board_build.flash_mode = dio
+board_build.flash_size = 4MB
+
+monitor_speed = 115200
+
+build_flags = 
+    -D ARDUINO_USB_MODE=1
+    -D ARDUINO_USB_CDC_ON_BOOT=1
+
+lib_deps =
+    ESP32Async/AsyncTCP @ 3.3.2
+    ESP32Async/ESPAsyncWebServer @ 3.6.0
+    knolleary/PubSubClient @ ^2.8
+    bblanchon/ArduinoJson @ ^7.0.4
+```
+---
+## Начальная настройка (Captive Portal)
+
+1. При первом включении синий светодиод начнет мигать (2 раза в секунду).
+2. Подключитесь к Wi-Fi сети:
+   * SSID: IPMI-Config-AP
+   * Пароль: P@$$w0rd
+3. Дождитесь всплывающего окна авторизации или перейдите на http://192.168.4.1.
+4. Нажмите Rescan Networks, выберите вашу рабочую точку доступа и введите пароль.
+5. При необходимости укажите Static IP или оставьте DHCP.
+6. Нажмите Save & Connect. Контроллер сохранит настройки в NVS, перезагрузится и подключится к домашней сети. Светодиод погаснет.
+
+---
+## Сетевые интерфейсы
+1. Веб-интерфейс
+
+Доступен по адресу http://ipmi.local или по назначенному IP:
+
+* Кнопки физического управления: Power on/off (импульс 300 мс), Hard Power Off (5 с), Reset (импульс 300 мс).
+* Показания телеметрии (температура CPU, Load Average, RAM, SMART).
+* Настройки подключения к MQTT-брокеру (хост, порт, логин, пароль / удаление пароля).
+* Сброс Wi-Fi для повторного перехода в режим AP.
+
+## Мост консоли (Serial Bridge)
+Подключение к Linux-консоли мини-ПК выполняется по TCP через порт 2323:
+```text
+telnet ipmi.local 2323
+# или
+nc ipmi.local 2323
+```
+# Интеграция с Home Assistant (configuration.yaml)
+```text
+mqtt:
+  button:
+    - name: "IPC-R300 Power Press"
+      command_topic: "homeassistant/switch/mini_ipmi/power/set"
+      payload_press: "PRESS"
+      icon: "mdi:power"
+
+    - name: "IPC-R300 Hard Power Off"
+      command_topic: "homeassistant/switch/mini_ipmi/power/set"
+      payload_press: "FORCE_OFF"
+      icon: "mdi:power-plug-off"
+
+    - name: "IPC-R300 Hardware Reset"
+      command_topic: "homeassistant/switch/mini_ipmi/reset/set"
+      payload_press: "PRESS"
+      icon: "mdi:restart"
+
+  sensor:
+    - name: "IPC-R300 Status"
+      state_topic: "homeassistant/sensor/mini_ipmi/status"
+      icon: "mdi:server"
+
+    - name: "IPC-R300 CPU Temperature"
+      state_topic: "homeassistant/sensor/mini_ipmi/state"
+      unit_of_measurement: "°C"
+      value_template: "{{ value_json.temp }}"
+      device_class: temperature
+
+    - name: "IPC-R300 Load Average"
+      state_topic: "homeassistant/sensor/mini_ipmi/state"
+      value_template: "{{ value_json.load }}"
+      icon: "mdi:cpu-64-bit"
+
+    - name: "IPC-R300 Free RAM"
+      state_topic: "homeassistant/sensor/mini_ipmi/state"
+      unit_of_measurement: "MB"
+      value_template: "{{ value_json.mfree }}"
+      icon: "mdi:memory"
+
+  binary_sensor:
+    - name: "IPC-R300 /dev/sda SMART"
+      state_topic: "homeassistant/sensor/mini_ipmi/state"
+      value_template: "{{ 'ON' if value_json.sda == 1 else 'OFF' }}"
+      device_class: problem
+      payload_on: "OFF"
+      payload_off: "ON"
+
+    - name: "IPC-R300 /dev/sdb SMART"
+      state_topic: "homeassistant/sensor/mini_ipmi/state"
+      value_template: "{{ 'ON' if value_json.sdb == 1 else 'OFF' }}"
+      device_class: problem
+      payload_on: "OFF"
+      payload_off: "ON"
+```
+---
+## Аппаратные примечания при монтаже
+* Перемычка антенны: С завода нулевой резистор ведет к керамической антенне[cite: 8]. Для внешнего U.FL-разъема перепаяйте перемычку на контактную площадку разъема IPEX (или соедините площадки припоем).
+* Калибровка питания: До подключения ESP32 к mini360 настройте на выходе стабилизатора строго 5.05–5.08 В.
+* Изоляция: Плату контроллера и модуль оптопар внутри металлического шасси обязательно изолируйте термоусадкой или каптоновым скотчем.
