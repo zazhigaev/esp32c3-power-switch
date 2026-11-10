@@ -1,209 +1,254 @@
-# ESP32-C3 Mini-IPMI for IPC-R300
+# IPC-R300 Mini-IPMI & EC Hardware Watchdog
 
-Компактный аппаратный контроллер удалённого управления (Out-of-Band Management / mini-IPMI) для промышленного мини-ПК **IPC-R300** на базе чипа **ESP32-C3 Super Mini Pro** (RISC-V) с выносной U.FL-антенной[cite: 1, 5, 7].
+Компактная плата удаленного аппаратного управления и мониторинга сервера (mini-IPMI) на базе микроконтроллера **ESP32-C3 Super Mini**, предназначенная для установки внутри шасси материнской платы **IPC-R300**.
 
-Проект решает задачу надёжного дистанционного контроля электропитания, аппаратного сброса, сбора системной телеметрии и прямого доступа к консоли Linux по сети без необходимости разворачивать KVM-over-IP.
-
----
-
-## Основные возможности
-
-* **Гальваническая развязка управления:** Включение, выключение и аппаратный сброс реализованы через оптопары PC817/EL817, что исключает протекание уравнительных токов и защищает плату.
-* **Безопасный автозапуск (Safe Auto-Power):** Защита от случайных нажатий при перезагрузках ESP32 — контроллер проверяет статус шины питания и отклик шелла Linux перед выдачей импульса на кнопку включения.
-* **Сетевой мост консоли (TCP Serial Bridge):** Прямой доступ к шеллу ОС через TCP-порт `2323` (`telnet` / `nc`)[cite: 1]. Во время активной сессии консоли регулярный опрос телеметрии автоматически ставится на паузу.
-* **Сбор системной телеметрии (FSM):** Опрос ядра Linux с использованием статического буфера (без фрагментации памяти heap):
-  * Температура процессора (Atom C3538);
-  * Нагрузка системы (Load Average 1m);
-  * Использование оперативной памяти (Free / Total);
-  * Статус накопителей `/dev/sda` и `/dev/sdb` через SMART (`smartctl`).
-* **Интеграция с Home Assistant:** Публикация метрик и состояний по MQTT с подтверждением команд (`OK` / `BUSY`) и автоочисткой retained-сообщений[cite: 1].
-* **Captive Portal и сканер сетей:** При отсутствии подключения к Wi-Fi плата поднимает точку доступа с веб-интерфейсом, сканером сетей, выбором DHCP / Static IP и индикацией мигающим синим светодиодом (GPIO8).
-* **Поддержка mDNS:** Доступ к панели по имени хоста `http://ipmi.local` при получении адреса по DHCP.
+Прошивка реализует пассивный перехват и строчный анализ сервисного UART-потока встроенного контроллера (EC / CPLD платформы AMI Aptio V / Intel FSP), аппаратный сторожевой таймер зависания хоста (Watchdog FSM), гальванически развязанное управление кнопками питания и сброса, защищенный веб-интерфейс (Basic Auth с возможностью смены пароля и безопасного завершения сессии), а также публикацию телеметрии и прием команд по протоколу MQTT для интеграции в Home Assistant.
 
 ---
 
-## Архитектура и схемотехника
+## 1. Ключевые возможности
 
-### Аппаратная часть
-* **Микроконтроллер:** ESP32-C3 Super Mini Pro (4MB Flash, разъем U.FL/IPEX)[cite: 1, 5, 7].
-* **Преобразователь питания:** mini360 (вход 12V от разъема материнской платы -> выход 5.05–5.08V на вход 5V платы ESP32)[cite: 1, 8].
-* **Оптопары:** 2 шт. PC817 / EL817C (корпус DIP-4 или SOP-4)[cite: 1].
-* **Токоограничивающие резисторы:** 2 шт. номиналом 220–330 Ом.
-* **Внешняя антенна:** FPC-антенна 2.4 ГГц с пигтейлом IPEX/U.FL[cite: 1, 6, 7].
-
-### Назначение контактов (Pinout)
-
-| Вывод ESP32-C3 | Физический пин платы | Цепь / Назначение | Примечание |
-| :--- | :--- | :--- | :--- |
-| **GPIO1**[cite: 1] | `1` | Анод оптопары Power SW (через резистор 220–330 Ом) | Импульс 300 мс (включение) / 5000 мс (Hard Off)[cite: 1] |
-| **GPIO3**[cite: 1] | `3`[cite: 8] | Анод оптопары Reset (через резистор 220–330 Ом) | Импульс 300 мс (сброс)[cite: 1] |
-| **GPIO4**[cite: 1] | `4`[cite: 8] | **UART RX** <- Пин 2 разъёма TTL UART | Прием данных и проверка активности материнки |
-| **GPIO5**[cite: 1] | `5`[cite: 8] | **UART TX** -> Пин 3 разъёма TTL UART | Передача команд телеметрии и ввод в консоль |
-| **GPIO8**[cite: 1] | Встроенный LED | Синий светодиод индикации | Мигание 2 Гц в режиме AP, выключен в STA |
-| **GND** | `G`[cite: 8] | Общий провод (Земля) | Подключается к пину 1 разъёма TTL UART |
-| **5V** | `5V`[cite: 8] | Вход питания +5В | Подключается к выходу DC-DC mini360 |
+* **Пассивный EC/POST декодер:** Не требует установки драйверов, ОС-демонов или агентского ПО на стороне хоста. Контроллер перехватывает фазы инициализации вторичных шин (`PWR init state`), дежурные режимы ACPI (`Power state S4/S5`) и контрольные точки UEFI BIOS.
+* **Аппаратный FSM Watchdog (восстановление хоста):**
+  * Если BIOS застывает на этапе инициализации оборудования (`HOST_BOOTING`) дольше 30 секунд, контроллер подает короткий импульс питания (200 мс) для выключения.
+  * Если система не выключилась за 5 секунд — выдается аппаратный сброс (Reset 200 мс).
+  * При подтвержденном выключении через 3 секунды подается чистый импульс включения.
+* **Безопасный автозапуск (Auto-Power):** При подаче питания на стойку/БП контроллер выжидает 5 секунд. Если хост уже работает, загружается или находится в цикле восстановления — импульс блокируется.
+* **Потокобезопасная архитектура FreeRTOS:**
+  * Задачи асинхронного веб-сервера (`AsyncTCP`) и основной цикл (`loopTask`) строго изолированы.
+  * Все команды на изменение питания и запись в NVS передаются через очередь `cmdQueue`.
+  * Чтение и обновление системной конфигурации защищены мьютексом `cfgMutex`.
+  * Кэш учетных данных авторизации защищен отдельным легковесным мьютексом `authMutex`, а смена пароля подтверждается клиенту синхронно через бинарный семафор `authDoneSem`.
+* **64-битный монотонный Uptime:** Подсчет непрерывного времени работы хоста и ESP32 осуществляется через нативный таймер `esp_timer_get_time()`, исключающий сброс в ноль при переполнении 32-битного `millis()` каждые 49.7 суток.
+* **Аппаратный аварийный сброс (GPIO9 / BOOT):** Возможность мгновенного возврата учетных данных веб-интерфейса к заводским значениям по удержанию физической кнопки при включении.
 
 ---
 
-## Схема соединений
+## 2. Аппаратная схема подключения
 
-```text
-               +-------------------------------------------+
-               |             IPC-R300 Mainboard            |
-               |                                           |
-               |  [Power Button +3.3V]  [Reset Pad +3.3V]  |
-               |         |                    |            |
-               |         |                    |            |
-               |  [TTL UART Header]           |            |
-               |   Pin 1: GND                 |            |
-               |   Pin 2: TX (3.3V)           |            |
-               |   Pin 3: RX (3.3V)           |            |
-               +---|------|---------^---------|------^-----+
-                   |      |         |         |      |
-                   |      |         |    +----+      |
-                   |      |         |    |           |
-+-------------+    |      |         |    | Pin 4     | Pin 4
-|  DC-DC      |    |      |         |  +---------+ +---------+
-|  mini360    |    |      |         |  | PC817   | | PC817   |
-| 12V -> 5.0V |    |      |         |  | (Reset) | | (Power) |
-+------+------+    |      |         |  +---------+ +---------+
-   |   |           |      |         |    | Pin 3     | Pin 3
-  +5V GND          |      |         |    +----+      +----+
-   |   |           |      |         |         |           |
-   |   +-----------+------+---------+---------+-----------+
-   |   |           | (Общий провод GND)
-   v   v
-+------+---------------------------------------------------+
-|  5V  GND      GPIO4(RX)  GPIO5(TX)     GPIO3       GPIO1 |
-|                                          |           |   |
-|            ESP32-C3 Super Mini Pro       |220R       |220R
-|                                          v           v   |
-|                                        Pin 1       Pin 1 |
-|                                      (Анод)      (Анод)  |
-|                                      +---------+ +-----+ |
-|                                      | PC817   | |PC817| |
-|                                      +---------+ +-----+ |
-|                                        Pin 2       Pin 2 |
-|                                       (Катод)     (Катод)|
-|                                          +-----------+   |
-|                                          |               |
-|                                          +---> к GND платы
-+----------------------------------------------------------+
+### Назначение выводов ESP32-C3 Super Mini
+
+| Пин ESP32-C3 | Направление | Назначение | Описание подключения |
+| :--- | :---: | :--- | :--- |
+| **GPIO1** | Выход | Power SW | Резистор 150 Ом $\to$ Анод оптопары PC817 (1) |
+| **GPIO3** | Выход | Reset SW | Резистор 150 Ом $\to$ Анод оптопары PC817 (2) |
+| **GPIO4** | Вход | UART1 RX | TX сервисного разъема EC платы IPC-R300 |
+| **GPIO5** | Выход | UART1 TX | RX разъема EC (зарезервировано) |
+| **GPIO8** | Выход | Светодиод платы | Синий LED платы (индикация режимов и сброса) |
+| **GPIO9** | Вход | Кнопка BOOT | Аппаратная кнопка на плате (подтяжка к 3.3V) |
+| **GND** | Питание | Общий минус | GND дежурного питания сервера |
+| **5V / VIN** | Питание | +5V Standby | Дежурная линия +5VSB источника питания |
+
+### Принципиальная схема включения
+
+```
+               ESP32-C3 Super Mini               PC817              IPC-R300 FP Header
+             +---------------------+          +---------+          +-------------------+
+             |                     |          |  1   4  |          |
+             |               GPIO1 +--[150R]--+--|>|-+  +----------+ PWR_SW+ (+3.3V)   |
+             |                     |          |      |  |          |                   |
+             |                 GND +----------+------+--+----------+ PWR_SW- (GND)     |
+             |                     |          |  2   3  |          |                   |
+             |                     |          +---------+          |                   |
+             |                     |                               |                   |
+             |                     |          +---------+          |                   |
+             |               GPIO3 +--[150R]--+--|>|-+  +----------+ RESET+ (+3.3V)    |
+             |                     |          |      |  |          |                   |
+             |                 GND +----------+------+--+----------+ RESET- (GND)     |
+             |                     |          |  2   3  |          +-------------------+
+             |                     |          +---------+
+             |                     |
+             |   GPIO4 (UART RX)   +<------------------------------ TX EC Debug Header
+             |                 GND +------------------------------- GND Материнской платы
+             |                     |
+             |   GPIO9 (BOOT BTN)  +--[SW]--+ (на плате)
+             |                 GND +--------+
+             +---------------------+
 ```
 
----
-## Сборка и прошивка (PlatformIO)
-
-Конфигурация platformio.ini
-```text
-[env:esp32-c3-supermini]
-platform = espressif32
-board = esp32-c3-devkitm-1
-framework = arduino
-
-board_build.flash_mode = dio
-board_build.flash_size = 4MB
-
-monitor_speed = 115200
-
-build_flags = 
-    -D ARDUINO_USB_MODE=1
-    -D ARDUINO_USB_CDC_ON_BOOT=1
-
-lib_deps =
-    ESP32Async/AsyncTCP @ 3.3.2
-    ESP32Async/ESPAsyncWebServer @ 3.6.0
-    knolleary/PubSubClient @ ^2.8
-    bblanchon/ArduinoJson @ ^7.0.4
-```
----
-## Начальная настройка (Captive Portal)
-
-1. При первом включении синий светодиод начнет мигать (2 раза в секунду).
-2. Подключитесь к Wi-Fi сети:
-   * SSID: IPMI-Config-AP
-   * Пароль: P@$$w0rd
-3. Дождитесь всплывающего окна авторизации или перейдите на http://192.168.4.1.
-4. Нажмите Rescan Networks, выберите вашу рабочую точку доступа и введите пароль.
-5. При необходимости укажите Static IP или оставьте DHCP.
-6. Нажмите Save & Connect. Контроллер сохранит настройки в NVS, перезагрузится и подключится к домашней сети. Светодиод погаснет.
+> **Важно по токоограничивающим резисторам:** На управляющих входах оптопар (GPIO1, GPIO3) необходимо применять токоограничивающие резисторы сопротивлением **150 Ом**. При логическом уровне 3.3 В номинал 150 Ом задает ток через инфракрасный диод около $13\dots14\text{ мА}$, обеспечивая переход фототранзистора PC817 в режим глубокого насыщения ($R_{CE} < 10\text{ Ом}$) для преодоления низкоомных подтяжек на материнской плате.
 
 ---
-## Сетевые интерфейсы
-1. Веб-интерфейс
 
-Доступен по адресу http://ipmi.local или по назначенному IP:
+## 3. Таблица контрольных точек BIOS (AMI / Intel FSP)
 
-* Кнопки физического управления: Power on/off (импульс 300 мс), Hard Power Off (5 с), Reset (импульс 300 мс).
-* Показания телеметрии (температура CPU, Load Average, RAM, SMART).
-* Настройки подключения к MQTT-брокеру (хост, порт, логин, пароль / удаление пароля).
-* Сброс Wi-Fi для повторного перехода в режим AP.
+| POST (HEX) | Статус платформы | Описание аппаратного этапа |
+| :--- | :--- | :--- |
+| `0x00000000` | **OS Running / Heartbeat** | Управление передано ядру ОС (S0), система активна |
+| `0x0000001C` | **Power State S4/S5 (Off)** | Завершено снятие вторичных шин питания (дежурный режим) |
+| `0x00000024` | **RAM SPD Addressing** | Опрос микросхем SPD модулей оперативной памяти |
+| `0x00000025` | **RAM Training MRC** | Инициализация и калибровка контроллера памяти Intel MRC |
+| `0x00000055` | **RAM Error / Not Detected** | Аппаратный сбой памяти: модуль не обнаружен / ошибка MRC |
+| `0x00000071` | **PCH SATA Controller Init** | Инициализация SATA-контроллера чипсета |
+| `0x00000075` | **Storage Detection** | Поиск и идентификация накопителей (SSD/HDD) |
+| `0x00000077` | **SATA Devices Configured** | Накопители успешно опознаны и настроены |
+| `0x00000079` | **Storage / SSD Failure** | Аппаратный сбой инициализации дисковой подсистемы |
+| `0x00000088` | **PCIe Bus Enumeration** | Сканирование и конфигурирование шины PCI Express |
+| `0x00000091` | **PCIe Subsystem Setup** | Инициализация устройств PCIe (сетевые чипы Intel i211/i225) |
+| `0x00000095` | **PCIe Resource Allocation** | Распределение ресурсов адресации и прерываний PCIe |
+| `0x00000098` | **Console Input Devices** | Инициализация интерфейсов ввода (USB HID / клавиатура) |
+| `0x00000099` | **BDS: Super I/O Hand-off** | Передача управления BDS-секвенсеру загрузки |
+| `0x0000009C` | **USB Controllers Ready** | Контроллеры USB xHCI готовы к работе |
 
-## Мост консоли (Serial Bridge)
-Подключение к Linux-консоли мини-ПК выполняется по TCP через порт 2323:
-```text
-telnet ipmi.local 2323
-# или
-nc ipmi.local 2323
-```
-# Интеграция с Home Assistant (configuration.yaml)
-```text
+---
+
+## 4. Безопасность, аутентификация и сброс через GPIO9
+
+### Доступ к веб-интерфейсу
+
+Все страницы управления, эндпоинты импульсов и REST API защищены HTTP Basic Authentication.
+* **Заводские учетные данные по умолчанию:**
+  * **Логин:** `admin`
+  * **Пароль:** `admin`
+* При первичной настройке в режиме точки доступа (`IPMI-Config-AP`, IP `192.168.4.1`) мастер настройки сети открыт без пароля.
+
+### Синхронная смена пароля и завершение сессии
+
+1. В карточке **Security / Password** можно задать новый логин (1–31 символов) и пароль (4–63 символов).
+2. Запрос отправляется на `/api/settings/auth`. Команда передается в `cmdQueue`, а HTTP-задача синхронно ожидает подтверждения через семафор `authDoneSem`. Браузер получает ответ `200 OK` только тогда, когда новые данные сохранены в NVS и зафиксированы в оперативной памяти под защитой `authMutex`.
+3. После смены учетных данных происходит автоматический редирект на `/logout`.
+4. Кнопка **Logout** в интерфейсе отправляет клиенту сброс сохраненных учетных данных без застревания на технической странице 401.
+
+### Аварийный сброс учетных данных (Кнопка BOOT на GPIO9)
+
+Если логин или пароль от веб-интерфейса утеряны:
+
+1. Обесточьте плату или удерживайте кнопку **RESET** на модуле ESP32-C3.
+2. Зажмите физическую кнопку **BOOT (GPIO9)** на плате Super Mini.
+3. Подайте питание (или отпустите Reset), продолжая удерживать **BOOT**.
+4. Светодиод (GPIO8) перейдет в режим частого стробирования (100 мс).
+5. Удерживайте кнопку **3 секунды**, пока светодиод не загорится непрерывно на 1 секунду.
+6. Отпустите кнопку. Контроллер очистит ключи `http_user` и `http_pass` в NVS и восстановит пару `admin / admin`. Настройки Wi-Fi и параметры брокера MQTT сохраняются без изменений.
+
+---
+
+## 5. REST API спецификация
+
+| Метод | Эндпоинт | Аутентификация | Описание |
+| :--- | :--- | :---: | :--- |
+| `GET` | `/` | Basic Auth | Главный дашборд управления и телеметрии |
+| `GET` | `/logout` | Нет | Завершение текущей сессии и очистка заголовков |
+| `GET` | `/api/metrics` | Basic Auth | JSON-снапшот статуса, кодов POST и аптайма |
+| `POST` | `/pwr/pulse` | Basic Auth | Импульс кнопки Power (200 мс) |
+| `POST` | `/pwr/force` | Basic Auth | Аппаратное удержание Power (5 сек, Force Off) |
+| `POST` | `/reset` | Basic Auth | Импульс кнопки Reset (200 мс) |
+| `GET` | `/api/settings/mqtt` | Basic Auth | Получение текущей конфигурации MQTT |
+| `POST` | `/api/settings/mqtt` | Basic Auth | Сохранение настроек брокера MQTT |
+| `POST` | `/api/settings/auth` | Basic Auth | Синхронное обновление логина и пароля |
+| `POST` | `/api/reset_wifi` | Basic Auth | Сброс сетевых настроек и рестарт в режим AP |
+
+---
+
+## 6. Интеграция с MQTT и Home Assistant
+
+### Топики MQTT
+
+| Топик | QOS / Retain | Формат нагрузки | Назначение |
+| :--- | :---: | :--- | :--- |
+| `homeassistant/sensor/mini_ipmi/status` | 1 / True | `online` \| `booting` \| `hung` \| `offline` | Текущий рабочий статус хоста |
+| `homeassistant/sensor/mini_ipmi/post_code` | 1 / True | `00000000` (HEX) | Последний перехваченный POST-код |
+| `homeassistant/sensor/mini_ipmi/post_desc` | 1 / True | Строка UTF-8 | Текстовая расшифровка этапа |
+| `homeassistant/sensor/mini_ipmi/pwr_state` | 1 / True | Строка | Линия питания (`S0 (Active)`, `S4/S5 (Off)`) |
+| `homeassistant/sensor/mini_ipmi/host_uptime` | 1 / True | Целое (секунды) | Аптайм ОС хоста (с момента кода 0x00) |
+| `homeassistant/sensor/mini_ipmi/esp_uptime` | 1 / True | Целое (секунды) | Непрерывный аптайм контроллера ESP32 |
+| `homeassistant/sensor/mini_ipmi/state` | 1 / True | JSON (до 512 B) | Сводный телеметрический пакет |
+| `homeassistant/switch/mini_ipmi/power/set` | 0 / False | `PRESS` \| `FORCE_OFF` | Команда управления питанием |
+| `homeassistant/switch/mini_ipmi/reset/set` | 0 / False | `PRESS` \| `RESET` | Команда аппаратного сброса |
+| `homeassistant/switch/mini_ipmi/result` | 1 / False | `OK` \| `BUSY` | Статус исполнения команды контроллером |
+
+### Конфигурация сущностей для Home Assistant (`configuration.yaml`)
+
+```yaml
 mqtt:
   button:
     - name: "IPC-R300 Power Press"
+      unique_id: ipcr300_power_press
       command_topic: "homeassistant/switch/mini_ipmi/power/set"
       payload_press: "PRESS"
       icon: "mdi:power"
 
     - name: "IPC-R300 Hard Power Off"
+      unique_id: ipcr300_power_force_off
       command_topic: "homeassistant/switch/mini_ipmi/power/set"
       payload_press: "FORCE_OFF"
       icon: "mdi:power-plug-off"
 
     - name: "IPC-R300 Hardware Reset"
+      unique_id: ipcr300_hardware_reset
       command_topic: "homeassistant/switch/mini_ipmi/reset/set"
       payload_press: "PRESS"
       icon: "mdi:restart"
 
   sensor:
-    - name: "IPC-R300 Status"
+    - name: "IPC-R300 Platform Status"
+      unique_id: ipcr300_platform_status
       state_topic: "homeassistant/sensor/mini_ipmi/status"
       icon: "mdi:server"
 
-    - name: "IPC-R300 CPU Temperature"
-      state_topic: "homeassistant/sensor/mini_ipmi/state"
-      unit_of_measurement: "°C"
-      value_template: "{{ value_json.temp }}"
-      device_class: temperature
+    - name: "IPC-R300 POST Code"
+      unique_id: ipcr300_post_code
+      state_topic: "homeassistant/sensor/mini_ipmi/post_code"
+      value_template: "0x{{ value }}"
+      icon: "mdi:barcode"
 
-    - name: "IPC-R300 Load Average"
-      state_topic: "homeassistant/sensor/mini_ipmi/state"
-      value_template: "{{ value_json.load }}"
-      icon: "mdi:cpu-64-bit"
+    - name: "IPC-R300 POST Description"
+      unique_id: ipcr300_post_desc
+      state_topic: "homeassistant/sensor/mini_ipmi/post_desc"
+      icon: "mdi:information-outline"
 
-    - name: "IPC-R300 Free RAM"
-      state_topic: "homeassistant/sensor/mini_ipmi/state"
-      unit_of_measurement: "MB"
-      value_template: "{{ value_json.mfree }}"
-      icon: "mdi:memory"
+    - name: "IPC-R300 Power Rail"
+      unique_id: ipcr300_power_rail
+      state_topic: "homeassistant/sensor/mini_ipmi/pwr_state"
+      icon: "mdi:flash"
+
+    - name: "IPC-R300 Host Uptime"
+      unique_id: ipcr300_host_uptime
+      state_topic: "homeassistant/sensor/mini_ipmi/host_uptime"
+      unit_of_measurement: "s"
+      device_class: duration
+      icon: "mdi:timer-outline"
+
+    - name: "IPC-R300 Controller Uptime"
+      unique_id: ipcr300_esp_uptime
+      state_topic: "homeassistant/sensor/mini_ipmi/esp_uptime"
+      unit_of_measurement: "s"
+      device_class: duration
+      icon: "mdi:chip"
 
   binary_sensor:
-    - name: "IPC-R300 /dev/sda SMART"
+    - name: "IPC-R300 Hardware Problem"
+      unique_id: ipcr300_hw_problem
       state_topic: "homeassistant/sensor/mini_ipmi/state"
-      value_template: "{{ 'ON' if value_json.sda == 1 else 'OFF' }}"
+      value_template: "{{ 'ON' if value_json.error else 'OFF' }}"
       device_class: problem
-      payload_on: "OFF"
-      payload_off: "ON"
-
-    - name: "IPC-R300 /dev/sdb SMART"
-      state_topic: "homeassistant/sensor/mini_ipmi/state"
-      value_template: "{{ 'ON' if value_json.sdb == 1 else 'OFF' }}"
-      device_class: problem
-      payload_on: "OFF"
-      payload_off: "ON"
 ```
+
 ---
-## Аппаратные примечания при монтаже
-* Перемычка антенны: С завода нулевой резистор ведет к керамической антенне[cite: 8]. Для внешнего U.FL-разъема перепаяйте перемычку на контактную площадку разъема IPEX (или соедините площадки припоем).
-* Калибровка питания: До подключения ESP32 к mini360 настройте на выходе стабилизатора строго 5.05–5.08 В.
-* Изоляция: Плату контроллера и модуль оптопар внутри металлического шасси обязательно изолируйте термоусадкой или каптоновым скотчем.
+
+## 7. Сборка проекта (PlatformIO)
+
+Файл `platformio.ini`:
+
+```ini
+[env:esp32-c3-devkitm-1]
+platform = espressif32
+board = esp32-c3-devkitm-1
+framework = arduino
+monitor_speed = 115200
+
+build_flags = 
+    -DARDUINO_USB_MODE=1
+    -DARDUINO_USB_CDC_ON_BOOT=1
+
+lib_deps =
+    bblanchon/ArduinoJson@^7.0.0
+    knolleary/PubSubClient@^2.8
+    mathieucarbou/ESPAsyncWebServer@^3.1.5
+    mathieucarbou/AsyncTCP@^3.1.4
+```
+
+Сборка и прошивка через CLI:
+```bash
+pio run -t upload
+pio device monitor
+```
