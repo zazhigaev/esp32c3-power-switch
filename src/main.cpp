@@ -1257,7 +1257,7 @@ void startCaptivePortal() {
     WiFi.mode(WIFI_AP_STA);
     IPAddress apIP(192, 168, 4, 1);
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-    WiFi.softAP("IPMI-Config-AP", "P@$$w0rd");
+    WiFi.softAP("IPMI-Config-AP", "p@ssword");
     dnsServer.start(DNS_PORT, "*", apIP);
 
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
